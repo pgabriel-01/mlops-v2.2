@@ -120,49 +120,79 @@
    
    After the script runs successfully, the GitHub project will be initialized with your project files.
 
-5. **Configure GitHub Actions Secrets**
+5. **Configure GitHub Actions Authentication with OIDC**
 
-   This step creates a service principal and GitHub secrets to allow the GitHub action workflows to create and interact with Azure Machine Learning Workspace resources.
+   This step creates an Azure AD application with federated credentials and GitHub secrets to allow the GitHub Action workflows to authenticate using OpenID Connect (OIDC) and create/interact with Azure Machine Learning Workspace resources.
 
-      From the command line, execute the following Azure CLI command with your choice of a service principal name:
-      > `# az ad sp create-for-rbac --name <service_principal_name> --role contributor --scopes /subscriptions/<subscription_id> --sdk-auth`
+   **IMPORTANT**: This solution now uses OIDC workload identity federation instead of client secrets for enhanced security. No client secrets are stored or managed.
 
-      You will get output similar to below:
+   **Step 5.1: Create Azure AD Application**
 
-      >`{`  
-      > `"clientId": "<service principal client id>",`  
-      > `"clientSecret": "<service principal client secret>",`  
-      > `"subscriptionId": "<Azure subscription id>",`  
-      > `"tenantId": "<Azure tenant id>",`  
-      > `"activeDirectoryEndpointUrl": "https://login.microsoftonline.com",`  
-      > `"resourceManagerEndpointUrl": "https://management.azure.com/",`  
-      > `"activeDirectoryGraphResourceId": "https://graph.windows.net/",`  
-      > `"sqlManagementEndpointUrl": "https://management.core.windows.net:8443/",`  
-      > `"galleryEndpointUrl": "https://gallery.azure.com/",`  
-      > `"managementEndpointUrl": "https://management.core.windows.net/"`  
-      > `}`
+   From the command line, create an Azure AD app registration:
+   > `# az ad app create --display-name <application_name>`
 
-      Copy all of this output, braces included.
+   This will output the application details. Copy the **appId** value.
 
-      From your GitHub project, select **Settings**:
+   **Step 5.2: Create Service Principal**
 
-      ![GitHub Settings](./images/gh-settings.png)
+   Create a service principal for the application:
+   > `# az ad sp create --id <app_id_from_previous_step>`
 
-      Then select **Secrets**, then **Actions**:
+   **Step 5.3: Assign Azure Permissions**
 
-      ![GitHub Secrets](./images/gh-secrets.png)
+   Assign the Contributor role to the service principal:
+   > `# az role assignment create --assignee <app_id> --role Contributor --scope /subscriptions/<subscription_id>`
 
-      Select **New repository secret**. Name this secret **AZURE_CREDENTIALS** and paste the service principal output as the content of the secret.  Select **Add secret**.
+   **Step 5.4: Configure Federated Identity Credentials**
 
-      > **Note:**  
-      > If deploying the infrastructure using terraform, add the following additional GitHub secrets using the corresponding values from the service principal output as the content of the secret:  
-      > 
-      > **ARM_CLIENT_ID**  
-      > **ARM_CLIENT_SECRET**  
-      > **ARM_SUBSCRIPTION_ID**  
-      > **ARM_TENANT_ID**  
+   Create federated credentials for GitHub Actions to authenticate without secrets. Run this for each branch you plan to use (main and any dev branches):
 
-      The GitHub configuration is complete.
+   For the **main** branch:
+   ```bash
+   az ad app federated-credential create --id <app_id> --parameters '{
+     "name": "github-main-branch",
+     "issuer": "https://token.actions.githubusercontent.com",
+     "subject": "repo:<github_org>/<repo_name>:ref:refs/heads/main",
+     "audiences": ["api://AzureADTokenExchange"],
+     "description": "GitHub Actions for main branch"
+   }'
+   ```
+
+   For a **dev** branch (optional, if using dev environment):
+   ```bash
+   az ad app federated-credential create --id <app_id> --parameters '{
+     "name": "github-dev-branch",
+     "issuer": "https://token.actions.githubusercontent.com",
+     "subject": "repo:<github_org>/<repo_name>:ref:refs/heads/dev",
+     "audiences": ["api://AzureADTokenExchange"],
+     "description": "GitHub Actions for dev branch"
+   }'
+   ```
+
+   **Step 5.5: Add GitHub Repository Secrets**
+
+   From your GitHub project, select **Settings**:
+
+   ![GitHub Settings](./images/gh-settings.png)
+
+   Then select **Secrets**, then **Actions**:
+
+   ![GitHub Secrets](./images/gh-secrets.png)
+
+   Add the following three repository secrets (select **New repository secret** for each):
+
+   1. **AZURE_CLIENT_ID**: The application (client) ID from step 5.1
+   2. **AZURE_TENANT_ID**: Your Azure tenant ID (get with `az account show --query tenantId -o tsv`)
+   3. **AZURE_SUBSCRIPTION_ID**: Your Azure subscription ID (get with `az account show --query id -o tsv`)
+
+   > **IMPORTANT NOTES:**
+   > - Do NOT create an **AZURE_CREDENTIALS** secret (deprecated)
+   > - Do NOT use the `--sdk-auth` flag (deprecated)
+   > - OIDC authentication provides enhanced security with no client secrets to manage or rotate
+   > - Each workflow will automatically receive short-lived tokens from GitHub
+   > - If deploying infrastructure with Terraform, no additional ARM_* secrets are needed (OIDC is configured in the provider)
+
+   The GitHub configuration is complete.
 
 ## Deploy Machine Learning Project Infrastructure Using GitHub Actions
 
@@ -174,14 +204,16 @@
 
 >**Important:**
 >> Note that `config-infra-prod.yml` and `config-infra-dev.yml` files use default region as **eastus** to deploy resource group and Azure ML Workspace. If you are using Free/Trial or similar learning purpose subscriptions, you must do one of the below  -
-> 1. If you decide to use **eastus** region, ensure that your subscription(s) have a quota/limit of up to 20 vCPUs for **Standard DSv2 Family vCPUs**. Visit Subscription page in Azure Portal as show below to validate this.
+> 1. If you decide to use **eastus** region, ensure that your subscription(s) have a quota/limit of up to 20 vCPUs for **Standard Dsv5 Family vCPUs** (or **Standard DSv2 Family vCPUs** for older deployments). Visit Subscription page in Azure Portal as shown below to validate this.
         ![alt text](images/susbcriptionQuota.png)
-> 2. If not, you should change it to a region where **Standard DSv2 Family vCPUs** has a quota/limit of up to 20 vCPUs.
-> 3. You may also choose to change the region and compute type being used for deployment. To do this you have to change region in these two files, and additionally search for **STANDARD_DS3_V2** in below listed DevOps pipeline files and change this with a compute type that would work for your setup.
->      * `mlops-templates/aml-cli-v2/mlops/devops-pipelines/deploy-model-training-pipeline.yml`
->      * `mlops-project-template/classical/aml-cli-v2/mlops/devops-pipelines/deploy-batch-endpoint-pipeline.yml`
->      * `/mlops-project-template/classical/aml-cli-v2/mlops/azureml/deploy/online/online-deployment.yml`
+> 2. If not, you should change it to a region where **Standard Dsv5 Family vCPUs** has a quota/limit of up to 20 vCPUs.
+> 3. You may also choose to change the region and compute type being used for deployment. The default compute is now **STANDARD_D4S_V5** (5th generation, improved performance). To change this, search for **STANDARD_D4S_V5** in the following pipeline files and change to a compute type that works for your setup:
+>      - `mlops-templates/aml-cli-v2/mlops/devops-pipelines/deploy-model-training-pipeline.yml`
+>      - `mlops-project-template/classical/aml-cli-v2/mlops/devops-pipelines/deploy-batch-endpoint-pipeline.yml`
+>      - `/mlops-project-template/classical/aml-cli-v2/mlops/azureml/deploy/online/online-deployment.yml`
 > 4. Note in the path above that you need to navigate to the right repository (e.g. **mlops-templates**), and the right ML interface (e.g. **aml-cli-v2**).
+>
+> **Note**: This modernized version uses **Standard_D4s_v5** (5th generation) instead of the older **Standard_DS3_v2** (3rd generation) for better performance and efficiency.
 
    Edit each file to configure a namespace, postfix string, Azure location, and environment for deploying your Dev and Prod Azure ML environments. Default values and settings in the files are show below:
 
