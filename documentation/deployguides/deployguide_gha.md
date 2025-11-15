@@ -143,6 +143,15 @@
    Assign the Contributor role to the service principal:
    > `# az role assignment create --assignee <app_id> --role Contributor --scope /subscriptions/<subscription_id>`
 
+   **Step 5.3a: Get Service Principal Object ID**
+
+   Get the object ID of the service principal (needed for Terraform configuration):
+   ```bash
+   az ad sp show --id <app_id> --query id -o tsv
+   ```
+   
+   Save this object ID - you'll need it when configuring Terraform variables in the infrastructure deployment section below.
+
    **Step 5.4: Configure Federated Identity Credentials**
 
    Create federated credentials for GitHub Actions to authenticate without secrets. Run this for each branch you plan to use (main and any dev branches):
@@ -228,13 +237,31 @@
    
    The first four values are used to create globally unique names for your Azure environment and contained resources. Edit these values to your liking then save, commit, push, or pr to update these files in the project repository.
 
+2. **Configure Terraform Variables (Required for GitHub Actions Permissions)**
+
+   In your project repository, edit the `infrastructure/terraform/terraform.tfvars` file to add the GitHub Actions service principal object ID:
+
+   ```hcl
+   # GitHub Actions service principal object ID for CI/CD permissions
+   # Get this value from Step 5.3a above:
+   # az ad sp show --id <app_id> --query id -o tsv
+   github_actions_service_principal_id = "your-service-principal-object-id"
+   ```
+
+   This configuration enables Terraform to automatically grant the GitHub Actions service principal the required permissions to:
+   - Register datasets in Azure ML
+   - Upload data to the workspace storage account
+   - Execute training pipelines that access data
+
+   These permissions (Storage Blob Data Reader and Storage Blob Data Contributor) will be automatically assigned to the Azure ML workspace storage account during infrastructure deployment.
+
    If you are running a Deep Learning workload such as CV or NLP, ensure your subscription and Azure location has available GPU compute. 
    
    > Note:
    >
    > The enable_monitoring flag in these files defaults to False. Enabling this flag will add additional elements to the deployment to support Azure ML monitoring based on https://github.com/microsoft/AzureML-Observability. This will include an ADX cluster and increase the deployment time and cost of the MLOps solution.
    
-2. **Deploy Azure Machine Learning Infrastructure**
+3. **Deploy Azure Machine Learning Infrastructure**
 
    In your GitHub project repository (ex: taxi-fare-regression), select **Actions**
 
