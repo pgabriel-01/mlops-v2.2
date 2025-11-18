@@ -150,7 +150,7 @@
    az ad sp show --id <app_id> --query id -o tsv
    ```
    
-   Save this object ID - you'll need it when configuring Terraform variables in the infrastructure deployment section below.
+   **IMPORTANT**: Save this object ID value. You will need to add it to `infrastructure/terraform/terraform.tfvars` as `github_actions_service_principal_id` in Step 2 below. This grants GitHub Actions the required permissions to register datasets, upload data, and execute training pipelines in your Azure ML workspace.
 
    **Step 5.4: Configure Federated Identity Credentials**
 
@@ -239,14 +239,28 @@
 
 2. **Configure Terraform Variables (Required for GitHub Actions Permissions)**
 
-   In your project repository, edit the `infrastructure/terraform/terraform.tfvars` file to add the GitHub Actions service principal object ID:
+   In your project repository, edit the `infrastructure/terraform/terraform.tfvars` file to add the GitHub Actions service principal object ID from Step 5.3a:
 
    ```hcl
-   # GitHub Actions service principal object ID for CI/CD permissions
+   namespace = "taxi"
+   postfix = "10005"
+   environment = "prod"  # or "dev" for dev branch
+   location = "eastus"
+   enable_aml_computecluster = true
+   enable_monitoring = false
+   
+   # REQUIRED: GitHub Actions service principal object ID for CI/CD permissions
    # Get this value from Step 5.3a above:
    # az ad sp show --id <app_id> --query id -o tsv
    github_actions_service_principal_id = "your-service-principal-object-id"
    ```
+
+   **Configuration Guidelines**:
+   - **namespace**: Short name for your project (keep it concise to avoid storage account name length limits)
+   - **postfix**: Unique identifier (e.g., "10005"). If redeploying after deletion, use a different postfix to avoid Azure ML workspace soft-delete conflicts (see note below)
+   - **environment**: "dev" or "prod" (should match your branch context)
+   - **location**: Azure region (default: "eastus")
+   - **github_actions_service_principal_id**: Service principal object ID from Step 5.3a (NOT the app ID)
 
    This configuration enables Terraform to automatically grant the GitHub Actions service principal the required permissions to:
    - Register datasets in Azure ML
@@ -254,6 +268,11 @@
    - Execute training pipelines that access data
 
    These permissions (Storage Blob Data Reader and Storage Blob Data Contributor) will be automatically assigned to the Azure ML workspace storage account during infrastructure deployment.
+
+   **Important - Azure ML Workspace Soft-Delete**: Azure ML workspaces are retained for 30 days after deletion. If you need to redeploy an environment with the same namespace:
+   - Use a different **postfix** value (e.g., change from "10005" to "10006")
+   - OR manually purge the soft-deleted workspace: `az ml workspace delete --name <workspace-name> --resource-group <rg-name> --permanently-delete`
+   - OR wait 30 days for automatic purge
 
    If you are running a Deep Learning workload such as CV or NLP, ensure your subscription and Azure location has available GPU compute. 
    
@@ -357,6 +376,84 @@ Select the **deploy-batch-endpoint-pipeline** from the workflows and click **Run
 Once completed, you will find the batch endpoint deployed in the Azure ML workspace and available for testing.
 
 ![aml-taxi-bep](./images/aml-taxi-bep.png)
+
+## Testing Deployed Endpoints
+
+After deploying your endpoints, you can test them to validate model inference.
+
+### Testing Online Endpoint
+
+1. **Get endpoint details**:
+   ```bash
+   az ml online-endpoint show --name <endpoint-name> \
+     --workspace-name <workspace-name> \
+     --resource-group <resource-group> \
+     --query "{ScoringUri:scoring_uri}" --output table
+   ```
+
+2. **Get authentication key**:
+   ```bash
+   az ml online-endpoint get-credentials --name <endpoint-name> \
+     --workspace-name <workspace-name> \
+     --resource-group <resource-group> \
+     --query "primaryKey" --output tsv
+   ```
+
+3. **Create test request** (pandas DataFrame JSON format):
+   
+   The online endpoint expects input in pandas DataFrame JSON format. Create a file `test-request.json`:
+   ```json
+   {
+     "input_data": {
+       "columns": ["distance", "dropoff_latitude", "dropoff_longitude", "dropoff_taxizone_id", "dropoff_borough", "extra", "fare_amount", "improvement_surcharge", "mta_tax", "passenger_count", "payment_type", "pickup_latitude", "pickup_longitude", "pickup_taxizone_id", "pickup_borough", "rate_code_id", "store_and_fwd_flag", "tip_amount", "tolls_amount", "total_amount", "trip_type"],
+       "index": [0, 1],
+       "data": [
+         [0.45, 40.67, -74.01, 7, "Manhattan", 0, 3.5, 0.3, 0.5, 1, 1, 40.68, -74.0, 7, "Manhattan", 1, "N", 0, 0, 4.3, 1],
+         [18.51, 40.64, -73.78, 132, "Queens", 0.5, 52.0, 0.3, 0.5, 1, 1, 40.77, -73.97, 237, "Manhattan", 1, "N", 10.0, 0, 63.3, 1]
+       ]
+     }
+   }
+   ```
+
+4. **Invoke endpoint**:
+   ```bash
+   curl -X POST "<scoring-uri>" \
+     -H "Authorization: Bearer <authentication-key>" \
+     -H "Content-Type: application/json" \
+     --data @test-request.json
+   ```
+
+5. **Expected output**: JSON array of predictions (e.g., `[7.14, 47.33]`)
+
+### Testing Batch Endpoint
+
+1. **Upload test data to workspace**:
+   ```bash
+   az ml data create --name taxi-batch \
+     --version 1 \
+     --workspace-name <workspace-name> \
+     --resource-group <resource-group> \
+     --path <path-to-test-data.csv> \
+     --type uri_file
+   ```
+
+2. **Invoke batch endpoint**:
+   ```bash
+   az ml batch-endpoint invoke --name <endpoint-name> \
+     --workspace-name <workspace-name> \
+     --resource-group <resource-group> \
+     --input <data-path> \
+     --input-type uri_file
+   ```
+
+3. **Monitor batch job**: The command will output a job ID. Use it to check status:
+   ```bash
+   az ml job show --name <job-id> \
+     --workspace-name <workspace-name> \
+     --resource-group <resource-group>
+   ```
+
+**Note**: Batch endpoint invocation requires Storage Blob Data Reader and Storage Blob Data Contributor roles on the workspace storage account. These are automatically granted to the GitHub Actions service principal if you configured `github_actions_service_principal_id` in Step 2.
    
  
 ## Moving to Production
@@ -365,6 +462,44 @@ Example scenarios can be trained and deployed both for Dev and Prod branches and
 
 The sample training and deployment Azure ML pipelines and GitHub workflows can be used as a starting point to adapt your own modeling code and data.
 
+## Destroying Environments
+
+When you need to tear down a development or production environment:
+
+1. **Automatic Endpoint Cleanup**: The destroy workflow automatically deletes all Azure ML endpoints (online and batch) before destroying the infrastructure. This prevents the "Cannot delete resource while nested resources exist" error.
+
+2. **Run the destroy workflow**:
+   ```bash
+   # For dev environment (run from dev branch)
+   gh workflow run tf-gha-deploy-infra.yml --ref dev -f action=destroy
+   
+   # For prod environment (run from main branch)
+   gh workflow run tf-gha-deploy-infra.yml --ref main -f action=destroy
+   ```
+
+3. **Monitor the workflow**: The destroy process takes approximately 7-10 minutes and includes:
+   - Detection of workspace existence
+   - Automatic deletion of all online endpoints
+   - Automatic deletion of all batch endpoints
+   - 60-second wait for endpoint deletions to process
+   - Terraform infrastructure destroy
+   - Automatic cleanup of Terraform state storage
+
+4. **Verify cleanup**:
+   ```bash
+   # Check for remaining resource groups
+   az group list --query "[?starts_with(name, 'rg-<namespace>-<postfix>')]" --output table
+   ```
+
+5. **Expected result**: All resource groups should be deleted, including:
+   - `rg-<namespace>-<postfix><environment>` (main resources)
+   - `rg-<namespace>-<postfix><environment>-tf` (Terraform state)
+   - Managed resource groups (automatically cleaned up)
+
+**Troubleshooting**:
+- If the destroy fails with endpoint errors, the endpoints may still be deleting. Wait 60 seconds and retry the destroy workflow.
+- If you manually deleted the workspace, the destroy workflow will skip endpoint deletion and proceed with cleanup.
+- Old resource groups from previous deployments with different postfix values must be manually deleted if desired.
 
 ## Next Steps
 ---
